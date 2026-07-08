@@ -74,9 +74,12 @@ def _extract_prompt_text(decoded: str) -> str:
     if "<|im_start|>" in decoded:
         user_chunks = []
         for segment in decoded.split("<|im_start|>"):
-            if not segment.startswith("user"):
+            # Only strip a real chat-template role header ("user\n").  Lance's
+            # native t2i format has no role header, so a caption that merely
+            # begins with the word "user" must survive intact.
+            if not segment.startswith("user\n"):
                 continue
-            content = segment[len("user") :].lstrip("\n")
+            content = segment[len("user\n") :]
             content = content.split("<|im_end|>", 1)[0]
             user_chunks.append(content)
         if user_chunks:
@@ -321,10 +324,13 @@ class LancePipelineWithLogProb(LancePipeline):
 
         sde_window: Optional[tuple[int, int]] = None
         if sde_window_size and noise_level > 0.0:
+            # LOCAL_RANK is a torchrun convention and is not guaranteed to be
+            # set in vllm-omni engine worker processes; fall back to rank 0
+            # (single shared window) instead of crashing the rollout.
             sde_window = _pick_sde_window(
                 window_size=int(sde_window_size),
                 window_range=sde_window_range,
-                seed=int(os.environ["LOCAL_RANK"]),
+                seed=int(os.environ.get("LOCAL_RANK", "0")),
             )
 
         # Pass scheduler kwargs; _LanceSchedulerAdapter overrides noise_level

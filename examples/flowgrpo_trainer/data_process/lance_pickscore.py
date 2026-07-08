@@ -66,11 +66,16 @@ def tokenize_lance_prompt(
     The serving path wraps raw ``tokenizer.encode(prompt)`` with
     ``<|im_start|>`` / ``<|im_end|>`` markers — no chat template.
     """
+    if max_length < 2:
+        raise ValueError(f"max_length must be >= 2 to fit the <|im_start|>/<|im_end|> markers, got {max_length}")
     bos_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
     eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     raw_ids = tokenizer.encode(user_text, add_special_tokens=False)
-    lance_ids = [bos_id] + raw_ids + [eos_id]
-    return lance_ids[:max_length]
+    # Truncate caption tokens, never the markers: the rollout re-wraps the
+    # decoded caption with a fresh <|im_end|>, so a stored sequence missing
+    # its terminal marker would make the trainer condition on different text
+    # than the rollout generated against.
+    return [bos_id] + raw_ids[: max_length - 2] + [eos_id]
 
 
 if __name__ == "__main__":

@@ -36,10 +36,13 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.workers.config import DiffusionModelConfig
 
-from .common import LANCE_FLOWGRPO_CFG_DEFAULTS, setup_lance_sigmas
+from .common import LANCE_FLOWGRPO_CFG_DEFAULTS, LANCE_TIMESTEP_SHIFT, setup_lance_sigmas
 from .lance_model import LanceForTraining, get_flattened_position_ids
 
 logger = logging.getLogger(__name__)
+
+# micro-batch key holding step-independent model inputs (see prepare_model_inputs)
+_STEP_INDEPENDENT_CACHE_KEY = "_lance_step_independent_inputs"
 
 
 @DiffusionModelBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo")
@@ -84,7 +87,18 @@ class LanceDiffusion(DiffusionModelBase):
 
     @classmethod
     def set_timesteps(cls, scheduler: FlowMatchSDEDiscreteScheduler, model_config: DiffusionModelConfig, device: str):
-        setup_lance_sigmas(scheduler, model_config.pipeline.num_inference_steps, device=device)
+        # Honor a timestep_shift override so the training schedule matches a
+        # rollout-side override (set both sides together, as for the CFG
+        # params)::
+        #
+        #     +actor_rollout_ref.rollout.pipeline.timestep_shift=3.0
+        #     +actor_rollout_ref.model.pipeline.timestep_shift=3.0
+        #
+        # The rollout builds sigmas from ``extra_args["timestep_shift"]``; a
+        # mismatched shift here would make the trainer's exact-equality
+        # timestep lookup fail (or silently corrupt dt/sigma_prev).
+        shift = float(getattr(model_config.pipeline, "timestep_shift", LANCE_TIMESTEP_SHIFT))
+        setup_lance_sigmas(scheduler, model_config.pipeline.num_inference_steps, shift=shift, device=device)
 
     @classmethod
     def _get_latent_pos_ids(cls, model_config: DiffusionModelConfig, module, device) -> torch.Tensor:
@@ -159,11 +173,22 @@ class LanceDiffusion(DiffusionModelBase):
         hidden_states = latents[:, step]
         timestep = timesteps[:, step]
 
-        text_token_ids, text_attention_mask = cls._prompt_token_ids_to_batch(micro_batch, device)
-
-        # Compute latent position IDs
-        latent_pos_ids = cls._get_latent_pos_ids(model_config, module, device)
-        latent_pos_ids = latent_pos_ids.unsqueeze(0).expand(B, -1)
+        # Token padding and latent position IDs are step-independent; compute
+        # them once per micro-batch instead of at every denoising step.
+        cached = tu.get_non_tensor_data(micro_batch, _STEP_INDEPENDENT_CACHE_KEY, default=None)
+        if cached is None or cached["text_token_ids"].device != device:
+            text_token_ids, text_attention_mask = cls._prompt_token_ids_to_batch(micro_batch, device)
+            latent_pos_ids = cls._get_latent_pos_ids(model_config, module, device)
+            latent_pos_ids = latent_pos_ids.unsqueeze(0).expand(B, -1)
+            cached = {
+                "text_token_ids": text_token_ids,
+                "text_attention_mask": text_attention_mask,
+                "latent_pos_ids": latent_pos_ids,
+            }
+            tu.assign_non_tensor(micro_batch, **{_STEP_INDEPENDENT_CACHE_KEY: cached})
+        text_token_ids = cached["text_token_ids"]
+        text_attention_mask = cached["text_attention_mask"]
+        latent_pos_ids = cached["latent_pos_ids"]
 
         model_inputs = {
             "hidden_states": hidden_states,
@@ -295,10 +320,13 @@ class LanceDiffusion(DiffusionModelBase):
         # unbiased. Rollout uses cfg_text_scale=4.0 + global renorm gated to
         # the Lance cfg_interval.
         cfg = cls._get_cfg_params(model_config)
-        # sigma at this denoising step (same for the entire batch)
-        sigma_now = float(timesteps[0, step].item())
-        in_cfg_interval = sigma_now > cfg["cfg_interval_low"] and sigma_now <= cfg["cfg_interval_high"]
-        apply_cfg = in_cfg_interval and cfg["cfg_text_scale"] > 1.0
+        # Gate the CFG interval per sample: trajectories from different
+        # rollout GPUs carry different SDE windows, so sigma at the same
+        # sliced step index can differ across the micro-batch and samples may
+        # straddle the interval boundary (Lance's cfg_interval_low is 0.4).
+        sigma_now = timesteps[:, step]  # (B,)
+        in_cfg_interval = (sigma_now > cfg["cfg_interval_low"]) & (sigma_now <= cfg["cfg_interval_high"])
+        apply_cfg = cfg["cfg_text_scale"] > 1.0 and bool(in_cfg_interval.any())
 
         if apply_cfg:
             assert negative_model_inputs is not None, (
@@ -311,7 +339,7 @@ class LanceDiffusion(DiffusionModelBase):
             # reuse ``noise_pred`` instead of running a third forward.
             cfg_img_pred = noise_pred if cfg["cfg_img_scale"] > 1.0 else None
 
-            noise_pred = cls._combine_cfg(
+            combined = cls._combine_cfg(
                 v_t=noise_pred,
                 cfg_text_v_t=cfg_text_pred,
                 cfg_img_v_t=cfg_img_pred,
@@ -320,6 +348,13 @@ class LanceDiffusion(DiffusionModelBase):
                 cfg_renorm_type=cfg["cfg_renorm_type"],
                 cfg_renorm_min=cfg["cfg_renorm_min"],
             )
+            if bool(in_cfg_interval.all()):
+                noise_pred = combined
+            else:
+                # _combine_cfg renormalizes per sample, so selecting rows is
+                # exact for the in-interval samples.
+                mask = in_cfg_interval.view(-1, *([1] * (noise_pred.dim() - 1)))
+                noise_pred = torch.where(mask, combined, noise_pred)
 
         _, log_prob, prev_sample_mean, std_dev_t, sqrt_dt = scheduler.sample_previous_step(
             sample=latents[:, step].float(),

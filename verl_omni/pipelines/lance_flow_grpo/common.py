@@ -25,9 +25,9 @@ import torch
 
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
-# Lance sampling constants (vllm-omni pinned ``LanceDefaults``).
+# Lance sampling constant (vllm-omni pinned ``LanceDefaults``).  The step
+# count is configured via ``pipeline.num_inference_steps``, not a constant.
 LANCE_TIMESTEP_SHIFT = 3.5
-LANCE_NUM_TIMESTEPS = 30
 
 # CFG defaults from the pinned Lance t2i serving path (``LanceDefaults`` +
 # ``LancePipeline.forward``); rollout and training must use the same values.

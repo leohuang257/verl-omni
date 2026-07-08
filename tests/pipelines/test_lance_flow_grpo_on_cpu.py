@@ -40,7 +40,7 @@ from verl_omni.pipelines.lance_flow_grpo.lance_model import (
     _map_training_to_checkpoint,
     get_flattened_position_ids,
 )
-from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import _pick_sde_window
+from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import _extract_prompt_text, _pick_sde_window
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 
@@ -121,6 +121,26 @@ class TestSchedule:
     def test_rejects_nonpositive_steps(self):
         with pytest.raises(ValueError):
             setup_lance_sigmas(FlowMatchSDEDiscreteScheduler(), 0)
+
+    def test_set_timesteps_honors_pipeline_timestep_shift(self):
+        """A rollout-side timestep_shift override must reach the training
+        scheduler too, or the trainer's exact-equality timestep lookup fails."""
+        from types import SimpleNamespace
+
+        from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+
+        num_steps = 15
+        overridden = FlowMatchSDEDiscreteScheduler()
+        model_config = SimpleNamespace(pipeline=SimpleNamespace(num_inference_steps=num_steps, timestep_shift=3.0))
+        LanceDiffusion.set_timesteps(overridden, model_config, "cpu")
+        expected = setup_lance_sigmas(FlowMatchSDEDiscreteScheduler(), num_steps, shift=3.0)
+        assert torch.allclose(overridden.timesteps, torch.tensor(expected))
+
+        default = FlowMatchSDEDiscreteScheduler()
+        model_config = SimpleNamespace(pipeline=SimpleNamespace(num_inference_steps=num_steps))
+        LanceDiffusion.set_timesteps(default, model_config, "cpu")
+        expected = setup_lance_sigmas(FlowMatchSDEDiscreteScheduler(), num_steps)
+        assert torch.allclose(default.timesteps, torch.tensor(expected))
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +387,25 @@ class TestCheckpointLoading:
         with pytest.raises(RuntimeError):
             _load_tiny(root, cfg)
 
+    def test_from_pretrained_keeps_rotary_inv_freq_fp32(self, tmp_path):
+        """The ``model.to(torch_dtype)`` cast in from_pretrained must not leave
+        a downcast inv_freq behind: the pinned rollout computes rotary
+        frequencies in fp32, and bf16 frequencies dephase the mRoPE cos/sin
+        from the rollout trajectory."""
+        # Use the 3B latent-geometry constants so from_pretrained's config
+        # (which reads only llm_config.json) matches the tiny checkpoint.
+        cfg = _tiny_config(latent_channel=48, max_latent_size=64)
+        root, _ = _write_tiny_checkpoint(tmp_path, cfg)
+
+        model = LanceForTraining.from_pretrained(str(root), torch_dtype=torch.bfloat16)
+        assert model.rotary_emb.inv_freq.dtype == torch.float32
+
+        pos = torch.stack([torch.arange(10), torch.arange(10) + 3, torch.arange(10) + 7]).unsqueeze(0)
+        cos, sin = model.rotary_emb(pos)
+        ref_cos, ref_sin = LanceRotaryEmbedding(cfg)(pos)
+        assert torch.equal(cos, ref_cos)
+        assert torch.equal(sin, ref_sin)
+
 
 def _load_tiny(root, cfg: LanceTrainingConfig):
     """Run the fail-closed load against a tiny checkpoint dir.
@@ -388,6 +427,136 @@ def _load_tiny(root, cfg: LanceTrainingConfig):
     if missing or unexpected:
         raise RuntimeError(f"missing={missing[:5]} unexpected={unexpected[:5]}")
     return model
+
+
+# ---------------------------------------------------------------------------
+#  Prompt text extraction
+# ---------------------------------------------------------------------------
+
+
+class TestPromptExtraction:
+    def test_native_caption_starting_with_user_is_not_stripped(self):
+        """Lance's native t2i format has no role header; a caption that merely
+        begins with the word "user" must survive intact."""
+        decoded = "<|im_start|>user interface design of a mobile app<|im_end|>"
+        assert _extract_prompt_text(decoded) == "user interface design of a mobile app"
+
+    def test_chat_template_role_header_is_stripped(self):
+        decoded = "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\na cat<|im_end|>\n"
+        assert _extract_prompt_text(decoded) == "a cat"
+
+    def test_plain_wrapped_caption(self):
+        assert _extract_prompt_text("<|im_start|>a red panda<|im_end|>") == "a red panda"
+
+
+# ---------------------------------------------------------------------------
+#  Training-side CFG gating and input caching
+# ---------------------------------------------------------------------------
+
+
+class TestTrainingAdapterForward:
+    def test_cfg_interval_gated_per_sample(self):
+        """Samples from different SDE windows can straddle the cfg_interval
+        boundary within one micro-batch; each sample must get the velocity the
+        rollout actually produced for its own sigma."""
+        from types import SimpleNamespace
+
+        from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+
+        scheduler = FlowMatchSDEDiscreteScheduler()
+        setup_lance_sigmas(scheduler, 10)
+        sigma_in = scheduler.timesteps[0]  # 1.0 — inside (0.4, 1.0]
+        sigma_out = scheduler.timesteps[-1]  # ~0.30 — outside
+        assert sigma_in > 0.4 and sigma_out <= 0.4
+
+        B, L, D = 2, 4, 8
+        torch.manual_seed(0)
+        latents = torch.randn(B, 2, L, D, dtype=torch.float32)
+        timesteps = torch.stack([sigma_in.view(1), sigma_out.view(1)])  # (B, 1)
+
+        class _ConstModule:
+            """Gen branch (text conditioned) predicts 2.0, uncond 1.0."""
+
+            def __call__(self, **kwargs):
+                hs = kwargs["hidden_states"]
+                val = 2.0 if kwargs.get("text_token_ids") is not None else 1.0
+                return (torch.full_like(hs, val),)
+
+        # cfg_renorm_min=1.0 disables the renorm shrink so the CFG-combined
+        # velocity (5.0) is distinguishable from the gen branch (2.0).
+        model_config = SimpleNamespace(
+            pipeline=SimpleNamespace(cfg_renorm_min=1.0),
+            algo=SimpleNamespace(noise_level=0.7, sde_type="sde"),
+        )
+        model_inputs = {"hidden_states": latents[:, 0], "text_token_ids": torch.ones(B, 3, dtype=torch.long)}
+        negative_model_inputs = {"hidden_states": latents[:, 0], "text_token_ids": None}
+
+        log_prob, prev_sample_mean, _, _ = LanceDiffusion.forward_and_sample_previous_step(
+            module=_ConstModule(),
+            scheduler=scheduler,
+            model_config=model_config,
+            model_inputs=model_inputs,
+            negative_model_inputs=negative_model_inputs,
+            scheduler_inputs={"all_latents": latents, "all_timesteps": timesteps},
+            step=0,
+        )
+
+        # Sample 0 (in interval): CFG-combined 1 + 4*(2-1) = 5.  Sample 1
+        # (below the interval): raw gen-branch velocity 2.
+        expected_v = torch.stack([torch.full((L, D), 5.0), torch.full((L, D), 2.0)])
+        ref_log_prob, ref_mean, _, _ = scheduler.sample_previous_step(
+            sample=latents[:, 0],
+            model_output=expected_v,
+            timestep=timesteps[:, 0],
+            noise_level=0.7,
+            prev_sample=latents[:, 1],
+            sde_type="sde",
+            return_logprobs=True,
+            return_sqrt_dt=True,
+            include_logprob_normalizer=False,
+        )[1:]
+        assert torch.allclose(prev_sample_mean, ref_mean)
+        assert torch.allclose(log_prob, ref_log_prob)
+
+    def test_prepare_model_inputs_caches_step_independent_tensors(self):
+        """Token padding and latent position IDs must be computed once per
+        micro-batch, not at every denoising step."""
+        from types import SimpleNamespace
+
+        from tensordict import TensorDict
+
+        from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+
+        B, T, L, D = 2, 3, 16, 8
+        micro_batch = TensorDict({"prompt_token_ids": torch.tensor([[1, 2, 3], [4, 5, 6]])}, batch_size=[B])
+        latents = torch.randn(B, T + 1, L, D)
+        timesteps = torch.rand(B, T)
+        module = SimpleNamespace(config=SimpleNamespace(latent_patch_size=1, vae_downsample=16, max_latent_size=8))
+        model_config = SimpleNamespace(pipeline=SimpleNamespace(height=64, width=64))
+
+        def _prepare(step):
+            return LanceDiffusion.prepare_model_inputs(
+                module=module,
+                model_config=model_config,
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=None,
+                prompt_embeds_mask=None,
+                negative_prompt_embeds=None,
+                negative_prompt_embeds_mask=None,
+                micro_batch=micro_batch,
+                step=step,
+            )
+
+        first, first_neg = _prepare(0)
+        second, _ = _prepare(1)
+        assert second["text_token_ids"] is first["text_token_ids"]
+        assert second["text_attention_mask"] is first["text_attention_mask"]
+        assert second["latent_pos_ids"] is first["latent_pos_ids"]
+        assert first_neg["text_token_ids"] is None
+        assert torch.equal(first["hidden_states"], latents[:, 0])
+        assert torch.equal(second["hidden_states"], latents[:, 1])
+        assert first["text_attention_mask"].all()
 
 
 # ---------------------------------------------------------------------------
@@ -516,33 +685,54 @@ class TestLoraCollection:
 # ---------------------------------------------------------------------------
 
 
+def _load_lance_pickscore_module():
+    """Load the data-process script without executing its __main__ body."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "lance_pickscore",
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "examples",
+            "flowgrpo_trainer",
+            "data_process",
+            "lance_pickscore.py",
+        ),
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakePickscoreTokenizer:
+    def __init__(self, caption_ids):
+        self._caption_ids = caption_ids
+
+    def convert_tokens_to_ids(self, tok):
+        return {"<|im_start|>": 151644, "<|im_end|>": 151645}[tok]
+
+    def encode(self, text, add_special_tokens=False):
+        assert not add_special_tokens
+        return list(self._caption_ids)
+
+
 class TestPromptFormat:
     def test_lance_prompt_wrap(self):
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location(
-            "lance_pickscore",
-            os.path.join(
-                os.path.dirname(__file__),
-                "..",
-                "..",
-                "examples",
-                "flowgrpo_trainer",
-                "data_process",
-                "lance_pickscore.py",
-            ),
-        )
-        module = importlib.util.module_from_spec(spec)
-
-        class _FakeTokenizer:
-            def convert_tokens_to_ids(self, tok):
-                return {"<|im_start|>": 151644, "<|im_end|>": 151645}[tok]
-
-            def encode(self, text, add_special_tokens=False):
-                assert not add_special_tokens
-                return [1, 2, 3]
-
-        # Load only the function we need without executing the __main__ body.
-        spec.loader.exec_module(module)
-        ids = module.tokenize_lance_prompt(_FakeTokenizer(), "a cat")
+        module = _load_lance_pickscore_module()
+        ids = module.tokenize_lance_prompt(_FakePickscoreTokenizer([1, 2, 3]), "a cat")
         assert ids == [151644, 1, 2, 3, 151645]
+
+    def test_lance_prompt_truncation_keeps_end_marker(self):
+        """Truncation must drop caption tokens, never <|im_end|>: the rollout
+        re-wraps the decoded caption with a fresh <|im_end|>, so a stored
+        sequence missing the marker diverges from the rollout conditioning."""
+        module = _load_lance_pickscore_module()
+        ids = module.tokenize_lance_prompt(_FakePickscoreTokenizer(range(1, 11)), "long caption", max_length=6)
+        assert ids == [151644, 1, 2, 3, 4, 151645]
+
+    def test_lance_prompt_rejects_tiny_max_length(self):
+        module = _load_lance_pickscore_module()
+        with pytest.raises(ValueError):
+            module.tokenize_lance_prompt(_FakePickscoreTokenizer([1]), "a cat", max_length=1)

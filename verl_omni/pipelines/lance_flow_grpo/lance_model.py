@@ -51,7 +51,6 @@ _LANCE_LATENT_PATCH_SIZE = 1
 _LANCE_MAX_LATENT_SIZE = 64
 _LANCE_LATENT_CHANNEL = 48
 _LANCE_VAE_DOWNSAMPLE = 16
-_LANCE_TIMESTEP_SHIFT = 3.5
 
 _IMAGE_CKPT_DIR = "Lance_3B"
 
@@ -73,7 +72,8 @@ class LanceTrainingConfig:
     max_latent_size: int = _LANCE_MAX_LATENT_SIZE
     latent_channel: int = _LANCE_LATENT_CHANNEL
     vae_downsample: int = _LANCE_VAE_DOWNSAMPLE
-    timestep_shift: float = _LANCE_TIMESTEP_SHIFT
+    # The sampling timestep shift is not a model property: the adapters read
+    # it from ``common.LANCE_TIMESTEP_SHIFT`` / the pipeline config.
     start_of_image_id: int = 151652  # <|vision_start|>
     end_of_image_id: int = 151653  # <|vision_end|>
 
@@ -396,12 +396,12 @@ class LanceMoTLayer(nn.Module):
         self.input_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LanceRotaryEmbedding(config)
 
     def forward(
         self,
         hidden_states: Tensor,
-        position_ids: Tensor,
+        cos: Tensor,
+        sin: Tensor,
         text_mask: Tensor,
         latent_mask: Tensor,
         L_ctx: int = 0,
@@ -411,7 +411,8 @@ class LanceMoTLayer(nn.Module):
 
         Args:
             hidden_states: ``(B, L, D)`` input sequence.
-            position_ids: ``(B, 3, L)`` multimodal (t, h, w) position ids.
+            cos: ``(B, L, head_dim)`` rotary cosines, shared by all layers.
+            sin: ``(B, L, head_dim)`` rotary sines, shared by all layers.
             text_mask: Bool mask — True for text pathway.
             latent_mask: Bool mask — True for gen pathway.
             L_ctx: Text context length for the causal split.
@@ -420,8 +421,6 @@ class LanceMoTLayer(nn.Module):
         Returns:
             Output of shape ``(B, L, D)``.
         """
-        cos, sin = self.rotary_emb(position_ids)
-
         text_idx = text_mask.nonzero(as_tuple=True)
         latent_idx = latent_mask.nonzero(as_tuple=True)
 
@@ -522,6 +521,9 @@ class LanceForTraining(NonDiffusersModelBase):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([LanceMoTLayer(config) for _ in range(config.num_hidden_layers)])
+        # One shared rotary module: position ids are identical across layers,
+        # so cos/sin are computed once per forward and passed into each layer.
+        self.rotary_emb = LanceRotaryEmbedding(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -672,8 +674,9 @@ class LanceForTraining(NonDiffusersModelBase):
         text_mask[:, -1] = True  # eoi
         latent_mask = ~text_mask
 
-        # 6. mRoPE (t, h, w) positions
+        # 6. mRoPE (t, h, w) positions — cos/sin computed once for all layers
         position_ids = self._build_position_ids(latent_pos_ids, text_attention_mask, L_ctx, B, dev)
+        cos, sin = self.rotary_emb(position_ids)
 
         # Key padding mask: zero-padded text tokens in uneven micro-batches
         # must not attend to image queries.  ``None`` keeps the flash backend.
@@ -686,12 +689,10 @@ class LanceForTraining(NonDiffusersModelBase):
         # 7. Transformer layers (split attention: text causal + image full)
         for layer in self.layers:
 
-            def _layer_fn(seq, pos_ids, text_mask_, latent_mask_, kpm, *, _layer=layer):
-                return _layer(seq, pos_ids, text_mask_, latent_mask_, L_ctx, key_padding_mask=kpm)
+            def _layer_fn(seq, cos_, sin_, text_mask_, latent_mask_, kpm, *, _layer=layer):
+                return _layer(seq, cos_, sin_, text_mask_, latent_mask_, L_ctx, key_padding_mask=kpm)
 
-            sequence = self._checkpointed_call(
-                _layer_fn, sequence, position_ids, text_mask, latent_mask, key_padding_mask
-            )
+            sequence = self._checkpointed_call(_layer_fn, sequence, cos, sin, text_mask, latent_mask, key_padding_mask)
 
         # 8. Final norm with MoT routing
         normed = sequence.new_zeros(sequence.shape)
@@ -763,12 +764,12 @@ class LanceForTraining(NonDiffusersModelBase):
                 f"(first 10: {sorted(unexpected)[:10]}). Refusing to load."
             )
 
-        # Non-persistent buffers (rotary inv_freq) are not in the checkpoint
-        # and are still on the meta device — rebuild them on CPU.
-        for layer in model.layers:
-            layer.rotary_emb = LanceRotaryEmbedding(config)
-
         model = model.to(torch_dtype)
+        # The non-persistent rotary inv_freq buffer is not in the checkpoint
+        # (still on the meta device); rebuild it *after* the dtype cast so it
+        # stays fp32.  A bf16 inv_freq would dephase the mRoPE cos/sin from
+        # the pinned rollout, which computes rotary frequencies in fp32.
+        model.rotary_emb = LanceRotaryEmbedding(config)
         return model
 
 
